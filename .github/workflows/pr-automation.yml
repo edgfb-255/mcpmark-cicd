@@ -1,0 +1,383 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          set -o pipefail
+          echo "Running ESLint..."
+          npm run lint 2>&1 | tee eslint-report.log
+
+      - name: Run Prettier check
+        id: prettier
+        run: |
+          set -o pipefail
+          echo "Running Prettier in check mode..."
+          npx prettier --check "src/**/*.js" 2>&1 | tee prettier-report.log
+
+      - name: Prepare Code Quality Report
+        id: prepare_code_quality
+        if: always()
+        run: |
+          echo "Generating code quality summary..."
+          {
+            echo '### Code Quality Report';
+            echo;
+            echo '#### ESLint';
+            if [ -f eslint-report.log ]; then
+              echo '\n<details><summary>ESLint Output</summary>';
+              echo '\n';
+              sed -e 's/`/\`/g' eslint-report.log | sed -e 's/^/    /';
+              echo '\n</details>';
+            else
+              echo '\nESLint report not available.';
+            fi;
+            echo;
+            echo '#### Prettier';
+            if [ -f prettier-report.log ]; then
+              echo '\n<details><summary>Prettier Output</summary>';
+              echo '\n';
+              sed -e 's/`/\`/g' prettier-report.log | sed -e 's/^/    /';
+              echo '\n</details>';
+            else
+              echo '\nPrettier report not available.';
+            fi;
+          } > code-quality-report.md
+
+      - name: Upload code quality artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-logs
+          path: |
+            eslint-report.log
+            prettier-report.log
+            code-quality-report.md
+
+      - name: Comment Code Quality Report on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const reportPath = path.join(process.cwd(), 'code-quality-report.md');
+            const body = fs.readFileSync(reportPath, 'utf8');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: tests
+        run: |
+          set -o pipefail
+          echo "Running test suite with coverage..."
+          npm test -- --coverage 2>&1 | tee test-output.log
+
+      - name: Generate coverage summary
+        id: coverage_summary
+        if: always()
+        run: |
+          echo "Generating coverage summary..."
+          SUMMARY_FILE="coverage-summary.md"
+          echo '### Test Coverage Report' > "$SUMMARY_FILE"
+          echo >> "$SUMMARY_FILE"
+          if [ -f coverage/lcov-report/index.html ]; then
+            echo 'Coverage HTML report generated at `coverage/lcov-report/index.html`.' >> "$SUMMARY_FILE"
+          fi
+          if [ -f coverage/coverage-final.json ]; then
+            echo '\n<details><summary>Raw Coverage JSON (first 200 lines)</summary>' >> "$SUMMARY_FILE"
+            echo '\n' >> "$SUMMARY_FILE"
+            head -n 200 coverage/coverage-final.json | sed -e 's/`/\`/g' >> "$SUMMARY_FILE"
+            echo '\n</details>' >> "$SUMMARY_FILE"
+          fi
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage/
+            test-output.log
+            coverage-summary.md
+
+      - name: Comment Test Coverage Report on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const summaryPath = path.join(process.cwd(), 'coverage-summary.md');
+            let body = '### Test Coverage Report\nNo coverage summary available.';
+            if (fs.existsSync(summaryPath)) {
+              body = fs.readFileSync(summaryPath, 'utf8');
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit for vulnerabilities
+        id: npm_audit
+        continue-on-error: true
+        run: |
+          echo "Running npm audit..."
+          npm audit --json > npm-audit.json || echo "npm audit completed with non-zero exit code"
+
+      - name: Run secret scan on diff
+        id: secret_scan
+        continue-on-error: true
+        uses: github/secret-scanning-action@v1
+
+      - name: Prepare Security Scan Report
+        id: prepare_security_report
+        if: always()
+        run: |
+          echo "Generating security scan report..."
+          REPORT_FILE="security-report.md"
+          echo '### Security Scan Report' > "$REPORT_FILE"
+          echo >> "$REPORT_FILE"
+          echo '#### Vulnerabilities (npm audit)' >> "$REPORT_FILE"
+          if [ -f npm-audit.json ]; then
+            echo '\n<details><summary>npm audit JSON (truncated)</summary>' >> "$REPORT_FILE"
+            echo '\n' >> "$REPORT_FILE"
+            head -n 200 npm-audit.json | sed -e 's/`/\`/g' >> "$REPORT_FILE"
+            echo '\n</details>' >> "$REPORT_FILE"
+          else
+            echo '\nNo npm audit report generated.' >> "$REPORT_FILE"
+          fi
+
+          echo >> "$REPORT_FILE"
+          echo '#### Dependencies' >> "$REPORT_FILE"
+          if [ -f package-lock.json ]; then
+            echo '\nDependency lockfile present. Consider running `npm audit` locally for detailed review.' >> "$REPORT_FILE"
+          else
+            echo '\nNo package-lock.json found. Dependency tree may be non-deterministic.' >> "$REPORT_FILE"
+          fi
+
+      - name: Upload security scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts
+          path: |
+            npm-audit.json
+            security-report.md
+
+      - name: Comment Security Scan Report on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const reportPath = path.join(process.cwd(), 'security-report.md');
+            let body = '### Security Scan Report\nNo security report available.';
+            if (fs.existsSync(reportPath)) {
+              body = fs.readFileSync(reportPath, 'utf8');
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          echo "Running build script..."
+          npm run build 2>&1 | tee build.log
+
+      - name: Start application
+        id: start_app
+        run: |
+          echo "Starting application in background..."
+          NODE_ENV=test node src/app.js > app.log 2>&1 &
+          echo $! > app.pid
+          sleep 5
+
+      - name: Validate endpoints
+        id: validate_endpoints
+        run: |
+          echo "Validating application endpoints..."
+          BASE_URL="http://localhost:3000"
+
+          function curl_with_retry() {
+            local url="$1"
+            local retries=5
+            local delay=3
+            local attempt=1
+            while [ $attempt -le $retries ]; do
+              echo "Attempt $attempt: GET $url"
+              if curl -fsS "$url" > /dev/null; then
+                echo "Success: $url reachable"
+                return 0
+              fi
+              echo "Failed: $url not reachable, retrying in $delay seconds..."
+              sleep $delay
+              attempt=$((attempt + 1))
+            done
+            echo "Error: $url not reachable after $retries attempts"
+            return 1
+          }
+
+          set -e
+          curl_with_retry "$BASE_URL/"
+          curl_with_retry "$BASE_URL/health"
+          curl_with_retry "$BASE_URL/status/deployment"
+
+      - name: Stop application
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            kill "$(cat app.pid)" || echo "Application already stopped"
+          fi
+
+      - name: Prepare Build Validation Report
+        if: always()
+        run: |
+          echo "Generating build validation report..."
+          REPORT_FILE="build-validation-report.md"
+          echo '### Build Validation' > "$REPORT_FILE"
+          echo >> "$REPORT_FILE"
+          if [ -f build.log ]; then
+            echo '\n<details><summary>Build Output</summary>' >> "$REPORT_FILE"
+            echo '\n' >> "$REPORT_FILE"
+            sed -e 's/`/\`/g' build.log | sed -e 's/^/    /' >> "$REPORT_FILE"
+            echo '\n</details>' >> "$REPORT_FILE"
+          fi
+          if [ -f app.log ]; then
+            echo '\n<details><summary>Application Log</summary>' >> "$REPORT_FILE"
+            echo '\n' >> "$REPORT_FILE"
+            sed -e 's/`/\`/g' app.log | sed -e 's/^/    /' >> "$REPORT_FILE"
+            echo '\n</details>' >> "$REPORT_FILE"
+          fi
+
+      - name: Upload build validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-validation-artifacts
+          path: |
+            build.log
+            app.log
+            build-validation-report.md
+
+      - name: Comment Build Validation Report on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const reportPath = path.join(process.cwd(), 'build-validation-report.md');
+            let body = '### Build Validation\nNo build validation report available.';
+            if (fs.existsSync(reportPath)) {
+              body = fs.readFileSync(reportPath, 'utf8');
+            }
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body,
+            });
